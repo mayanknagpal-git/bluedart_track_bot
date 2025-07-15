@@ -278,4 +278,9 @@ async def main():
         await app.shutdown()
 
 if __name__ == "__main__":
+    st.title("🎈 Bluedart Track Bot")
+    st.write(
+        "Add tracking with live alerts for Bluedart! Head over to @bluedart_track_bot on telegram."
+    )
+
     asyncio.run(main())
