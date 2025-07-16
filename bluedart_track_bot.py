@@ -1,17 +1,18 @@
 # bot.py
 
-import asyncio
-import json
 import logging
-import os
-
 import requests
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import os
+import json
+from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
 )
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import asyncio
+import hashlib
 import streamlit as st
 
 # --- CONFIG ---
@@ -19,7 +20,7 @@ TELEGRAM_BOT_TOKEN = st.secrets["TELEGRAM_BOT_TOKEN"]
 TRACKING_DATA_FILE = "tracking_data.json"
 
 # --- DATA STORAGE ---
-# {user_id: {awb: last_status}}
+# Updated structure: {user_id: {awb: {"status": last_status, "history_hash": history_hash}}}
 user_trackings = {}
 # Global scheduler instance
 scheduler = None
@@ -50,6 +51,23 @@ def load_tracking_data():
             with open(TRACKING_DATA_FILE, 'r') as f:
                 data = json.load(f)
                 user_trackings = {int(k): v for k, v in data.items()}
+                
+                # Convert old format to new format if needed
+                migrated_count = 0
+                for user_id, awbs in user_trackings.items():
+                    for awb, tracking_data in awbs.items():
+                        if isinstance(tracking_data, str):
+                            # Old format: just status string
+                            user_trackings[user_id][awb] = {
+                                "status": tracking_data,
+                                "history_hash": None  # Will be updated on first check
+                            }
+                            migrated_count += 1
+                
+                if migrated_count > 0:
+                    logger.info(f"Migrated {migrated_count} AWB records to new format")
+                    save_tracking_data()
+                
                 logger.info(f"Loaded {len(user_trackings)} user tracking records from {TRACKING_DATA_FILE}")
         else:
             user_trackings = {}
@@ -271,6 +289,16 @@ def fetch_bluedart_details(awb):
         logger.error(f"Error scraping AWB {awb}: {e}")
         return None, []
 
+# --- HELPER FUNCTIONS ---
+def calculate_history_hash(history):
+    """Calculate a hash of the tracking history to detect changes"""
+    if not history:
+        return None
+    
+    # Create a string representation of the history
+    history_str = "\n".join(history)
+    return hashlib.md5(history_str.encode()).hexdigest()
+
 # --- BOT COMMANDS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
@@ -411,7 +439,14 @@ async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user_id not in user_trackings:
             user_trackings[user_id] = {}
         
-        user_trackings[user_id][awb] = details["Status"]
+        # Get initial history for tracking
+        _, history = fetch_bluedart_details(awb)
+        history_hash = calculate_history_hash(history)
+        
+        user_trackings[user_id][awb] = {
+            "status": details["Status"],
+            "history_hash": history_hash
+        }
         save_tracking_data()
         
         logger.info(f"Successfully added AWB {awb} for user {user_id} ({username})")
@@ -897,7 +932,14 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user_id not in user_trackings:
             user_trackings[user_id] = {}
         
-        user_trackings[user_id][awb] = details["Status"]
+        # Get initial history for tracking
+        _, history = fetch_bluedart_details(awb)
+        history_hash = calculate_history_hash(history)
+        
+        user_trackings[user_id][awb] = {
+            "status": details["Status"],
+            "history_hash": history_hash
+        }
         save_tracking_data()
         
         await query.answer("✅ AWB added to tracking list!")
@@ -934,16 +976,39 @@ async def check_statuses(app):
     checked_count = 0
     
     for user_id, awbs in user_trackings.items():
-        for awb, last_status in list(awbs.items()):
+        for awb, tracking_data in list(awbs.items()):
             checked_count += 1
-            details, _ = fetch_bluedart_details(awb)
+            details, history = fetch_bluedart_details(awb)
             new_status = details["Status"] if details else "N/A"
             is_delivered = details.get("Is Delivered", False) if details else False
             
-            # Check for status changes
-            if new_status != last_status:
+            # Get stored tracking data
+            if isinstance(tracking_data, dict):
+                last_status = tracking_data.get("status", "N/A")
+                last_history_hash = tracking_data.get("history_hash")
+            else:
+                # Handle old format (just status string)
+                last_status = tracking_data
+                last_history_hash = None
+            
+            # Calculate current history hash
+            current_history_hash = calculate_history_hash(history)
+            
+            # Check for status changes OR history changes
+            status_changed = new_status != last_status
+            history_changed = current_history_hash != last_history_hash and last_history_hash is not None
+            
+            if status_changed or history_changed:
                 changes_made = True
-                logger.info(f"Status change detected - AWB {awb}: {last_status} -> {new_status}")
+                
+                # Log the type of change detected
+                change_type = []
+                if status_changed:
+                    change_type.append(f"status: {last_status} -> {new_status}")
+                if history_changed:
+                    change_type.append(f"tracking history updated")
+                
+                logger.info(f"Change detected for AWB {awb}: {', '.join(change_type)}")
                 
                 # If item is delivered, remove from tracking and send special notification
                 if is_delivered:
@@ -972,23 +1037,48 @@ async def check_statuses(app):
                     except Exception as e:
                         logger.error(f"Failed to send delivery notification to user {user_id} for AWB {awb}: {e}")
                 else:
-                    # Regular status update
-                    user_trackings[user_id][awb] = new_status
+                    # Regular status or history update
+                    user_trackings[user_id][awb] = {
+                        "status": new_status,
+                        "history_hash": current_history_hash
+                    }
                     
                     try:
-                        await app.bot.send_message(
-                            chat_id=user_id,
-                            text=(
+                        # Create appropriate notification message
+                        if status_changed and history_changed:
+                            notification_text = (
+                                f"🔔 **Status & History Update!**\n\n"
+                                f"📋 **AWB:** {awb}\n"
+                                f"📊 **New Status:** {new_status}\n"
+                                f"📜 **Tracking History:** Updated with new entries\n\n"
+                                f"Use `/track {awb}` for full details."
+                            )
+                        elif status_changed:
+                            notification_text = (
                                 f"🔔 **Status Update!**\n\n"
                                 f"📋 **AWB:** {awb}\n"
                                 f"📊 **New Status:** {new_status}\n\n"
                                 f"Use `/track {awb}` for full details."
-                            ),
+                            )
+                        elif history_changed:
+                            notification_text = (
+                                f"🔔 **Tracking Update!**\n\n"
+                                f"📋 **AWB:** {awb}\n"
+                                f"📊 **Status:** {new_status}\n"
+                                f"📜 **New tracking information available**\n\n"
+                                f"Use `/track {awb}` for full details."
+                            )
+                        else:
+                            continue  # No changes, should not reach here
+                        
+                        await app.bot.send_message(
+                            chat_id=user_id,
+                            text=notification_text,
                             parse_mode='Markdown'
                         )
-                        logger.info(f"Status notification sent to user {user_id} for AWB {awb}")
+                        logger.info(f"Update notification sent to user {user_id} for AWB {awb}")
                     except Exception as e:
-                        logger.error(f"Failed to send status notification to user {user_id} for AWB {awb}: {e}")
+                        logger.error(f"Failed to send update notification to user {user_id} for AWB {awb}: {e}")
     
     logger.info(f"Status check completed: {checked_count} AWBs checked, {sum(1 for user in user_trackings.values() for awb, status in user.items() if status != user_trackings.get(list(user_trackings.keys())[0], {}).get(awb, status))} changes detected")
     
